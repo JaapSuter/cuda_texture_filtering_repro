@@ -10,6 +10,8 @@
 using Texel = uint8_t;
 static constexpr int MAX_TEXEL = int(std::numeric_limits<Texel>::max());
 
+static constexpr bool SAMPLE_NORMALIZED = true;
+
 __global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Texel* dst_arr, int dst_elemPitch) {
 
     // Get the integer sample coordinates.
@@ -22,10 +24,14 @@ __global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Te
     if (y >= texDim.y) return;
     if (z >= texDim.z) return;
 
-    // Convert to normalized floating point texture coordinates at the texel center.
-    const float u = (float(x) + 0.5f) / float(texDim.x);
-    const float v = (float(y) + 0.5f) / float(texDim.y);
-    const float w = (float(z) + 0.5f) / float(texDim.z);
+    const float texNormalizeX = SAMPLE_NORMALIZED ? float(texDim.x) : 1.0f;
+    const float texNormalizeY = SAMPLE_NORMALIZED ? float(texDim.y) : 1.0f;
+    const float texNormalizeZ = SAMPLE_NORMALIZED ? float(texDim.z) : 1.0f;
+
+    // Convert to floating point texture coordinates at the texel center.
+    const float u = (float(x) + 0.5f) / texNormalizeX;
+    const float v = (float(y) + 0.5f) / texNormalizeY;
+    const float w = (float(z) + 0.5f) / texNormalizeZ;
 
     // Fetch the normalized texel value
     const float fTex = tex3D<float>(src_tex, u, v, w);
@@ -70,7 +76,7 @@ static bool test(dim3 texDim) {
     cudaTextureDesc texDesc{};
     texDesc.filterMode = cudaFilterModeLinear;
     texDesc.readMode = cudaReadModeNormalizedFloat;
-    texDesc.normalizedCoords = 1;    
+    texDesc.normalizedCoords = SAMPLE_NORMALIZED;
     
     cudaTextureObject_t src_cudaTex{};
     CUDA_ENSURE(cudaCreateTextureObject(&src_cudaTex, &resDesc, &texDesc, nullptr));
@@ -131,14 +137,30 @@ std::vector<bool> testAxis(int axis) {
     results.reserve(maxSize + 1);
     results.push_back(false); // zero texture size is N/A
 
+    bool hasFailed = false;
+
     for (unsigned int size = 1; size <= maxSize; ++size) {
+
+        const float halfTexelFloat = 0.5f / float(size);
+        const int halfTexelFixedDot8 = int(halfTexelFloat * 256.0f);
+        const float halfTexelFloatBack = float(halfTexelFixedDot8) / 256.0f * float(size);
+
+        if (false)
+            if (abs(0.5f - halfTexelFloatBack) >= 0.1f)
+                printf("At size: %d, half texel 0.5f != %.5f\n", size, halfTexelFloatBack);
 
         dim3 texDim{ otherSize, otherSize, otherSize };
         (&texDim.x)[axis] = size;
 
-        results.push_back(test(texDim));
+        const bool ok = test(texDim);
+        results.push_back(ok);
 
-        if (0 == size % 100)
+        if (!ok && !hasFailed) {
+            printf("First failure on %c axis at size: %d\n", 'X' + axis, size);
+            hasFailed = true;
+        }
+
+        if (0 == size % 1000)
             printf("Done %c axis at size: %d\n", 'X' + axis, size);
     }
 
