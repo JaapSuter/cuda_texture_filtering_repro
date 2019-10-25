@@ -10,7 +10,7 @@
 using Texel = uint8_t;
 static constexpr int MAX_TEXEL = int(std::numeric_limits<Texel>::max());
 
-static constexpr bool SAMPLE_NORMALIZED = true;
+static constexpr bool SAMPLE_NORMALIZED = false;
 
 __global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Texel* dst_arr, int dst_elemPitch) {
 
@@ -74,7 +74,7 @@ static bool test(dim3 texDim) {
     resDesc.res.array.array = src_cudaArr;
     
     cudaTextureDesc texDesc{};
-    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.filterMode = cudaFilterModeLinear;    
     texDesc.readMode = cudaReadModeNormalizedFloat;
     texDesc.normalizedCoords = SAMPLE_NORMALIZED;
     
@@ -140,15 +140,7 @@ std::vector<bool> testAxis(int axis) {
     bool hasFailed = false;
 
     for (unsigned int size = 1; size <= maxSize; ++size) {
-
-        const float halfTexelFloat = 0.5f / float(size);
-        const int halfTexelFixedDot8 = int(halfTexelFloat * 256.0f);
-        const float halfTexelFloatBack = float(halfTexelFixedDot8) / 256.0f * float(size);
-
-        if (false)
-            if (abs(0.5f - halfTexelFloatBack) >= 0.1f)
-                printf("At size: %d, half texel 0.5f != %.5f\n", size, halfTexelFloatBack);
-
+        
         dim3 texDim{ otherSize, otherSize, otherSize };
         (&texDim.x)[axis] = size;
 
