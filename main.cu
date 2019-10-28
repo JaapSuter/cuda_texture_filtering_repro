@@ -7,12 +7,12 @@
 
 #include "cuda_runtime.h"
 
-using Texel = uint8_t;
+using Texel = uint16_t;
 static constexpr int MAX_TEXEL = int(std::numeric_limits<Texel>::max());
 
-static constexpr bool SAMPLE_NORMALIZED = false;
+static constexpr bool SAMPLE_NORMALIZED = true;
 
-__global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Texel* dst_arr, int dst_elemPitch) {
+__global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, cudaSurfaceObject_t dst_surf, int rank) {
 
     // Get the integer sample coordinates.
     const int x = threadIdx.x + blockIdx.x * blockDim.x;
@@ -34,14 +34,20 @@ __global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Te
     const float w = (float(z) + 0.5f) / texNormalizeZ;
 
     // Fetch the normalized texel value
-    const float fTex = tex3D<float>(src_tex, u, v, w);
-
+    const float fTex = 1 == rank ? tex1D<float>(src_tex, u) :
+                       2 == rank ? tex2D<float>(src_tex, u, v) :
+                                   tex3D<float>(src_tex, u, v, w);
+     
     // Convert it to the non-normalized integer format.
     const Texel iTex = static_cast<Texel>(float(MAX_TEXEL) * fTex);
-
-    // Stick it in the output array.
-    const size_t flatIdx = (y + z * texDim.y) * dst_elemPitch + x;
-    dst_arr[flatIdx] = iTex;
+    
+    // Write it out.
+    if (1 == rank)
+        surf1Dwrite<Texel>(iTex, dst_surf, x * sizeof(Texel), cudaBoundaryModeTrap);
+    else if (2 == rank)
+        surf2Dwrite<Texel>(iTex, dst_surf, x * sizeof(Texel), y, cudaBoundaryModeTrap);
+    else
+        surf3Dwrite<Texel>(iTex, dst_surf, x * sizeof(Texel), y, z, cudaBoundaryModeTrap);
 }
 
 #define ENSURE(expr) do { if (expr) break; printf("Error: %s\n", #expr); std::abort(); } while (false)
@@ -49,17 +55,20 @@ __global__ void testForWidth_kernel(dim3 texDim, cudaTextureObject_t src_tex, Te
 
 static bool test(dim3 texDim) {
 
+    const int rank = 1 == texDim.z ? 1 == texDim.y ? 1 : 2 : 3;
+        
     const cudaExtent elemExtent = make_cudaExtent(texDim.x, texDim.y, texDim.z);
+    const cudaExtent elemDim{ elemExtent.width, rank > 1 ? elemExtent.height : 0, rank > 2 ? elemExtent.depth : 0 };
     const cudaExtent byteExtent = make_cudaExtent(texDim.x * sizeof(Texel), texDim.y, texDim.z);
 
     // Create source data (on the host), fill it with runs of increasing [0...255] values.
-    std::vector<uint8_t> src_hostArr(static_cast<size_t>(texDim.x) * texDim.y * texDim.z);
+    std::vector<Texel> src_hostArr(static_cast<size_t>(texDim.x) * texDim.y * texDim.z);
     std::iota(std::begin(src_hostArr), std::end(src_hostArr), 0);
 
     // Create a CUDA array and copy the data to it.
     const cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<Texel>();
     cudaArray_t src_cudaArr{};
-    CUDA_ENSURE(cudaMalloc3DArray(&src_cudaArr, &channelDesc, elemExtent, 0));
+    CUDA_ENSURE(cudaMalloc3DArray(&src_cudaArr, &channelDesc, elemDim, 0));
 
     cudaMemcpy3DParms memcpy3DParms{};
     memcpy3DParms.srcPtr = make_cudaPitchedPtr(src_hostArr.data(), texDim.x * sizeof(Texel), texDim.x, texDim.y);
@@ -69,9 +78,9 @@ static bool test(dim3 texDim) {
     CUDA_ENSURE(cudaMemcpy3D(&memcpy3DParms));
 
     // Create a CUDA texture object to access the CUDA array.
-    cudaResourceDesc resDesc{};
-    resDesc.resType = cudaResourceTypeArray;
-    resDesc.res.array.array = src_cudaArr;
+    cudaResourceDesc resTexDesc{};
+    resTexDesc.resType = cudaResourceTypeArray;
+    resTexDesc.res.array.array = src_cudaArr;
     
     cudaTextureDesc texDesc{};
     texDesc.filterMode = cudaFilterModeLinear;    
@@ -79,13 +88,19 @@ static bool test(dim3 texDim) {
     texDesc.normalizedCoords = SAMPLE_NORMALIZED;
     
     cudaTextureObject_t src_cudaTex{};
-    CUDA_ENSURE(cudaCreateTextureObject(&src_cudaTex, &resDesc, &texDesc, nullptr));
+    CUDA_ENSURE(cudaCreateTextureObject(&src_cudaTex, &resTexDesc, &texDesc, nullptr));
 
     // Create some CUDA memory to put the kernel result in.
-    cudaPitchedPtr dst_deviceArr{};
-    CUDA_ENSURE(cudaMalloc3D(&dst_deviceArr, byteExtent));
-    ENSURE(0 == dst_deviceArr.pitch % sizeof(Texel));
-    const int dst_elemPitch = int(dst_deviceArr.pitch / sizeof(Texel));    
+    cudaArray_t dst_cudaArr{};
+    CUDA_ENSURE(cudaMalloc3DArray(&dst_cudaArr, &channelDesc, elemDim, cudaArraySurfaceLoadStore));
+    
+    // Create a CUDA surface to write the kernel result through.
+    cudaResourceDesc resSurfDesc{};
+    resSurfDesc.resType = cudaResourceTypeArray;
+    resSurfDesc.res.array.array = dst_cudaArr;
+    
+    cudaSurfaceObject_t dst_cudaSurf{};
+    CUDA_ENSURE(cudaCreateSurfaceObject(&dst_cudaSurf, &resSurfDesc));
 
     // Launch the kernel and wait for it to finish.
     const dim3 blockDim{ 32, 32, 1 };
@@ -95,15 +110,15 @@ static bool test(dim3 texDim) {
         (texDim.z + blockDim.z - 1) / blockDim.z
     };
 
-    testForWidth_kernel<<<gridDim, blockDim>>>(texDim, src_cudaTex, static_cast<Texel*>(dst_deviceArr.ptr), dst_elemPitch);
+    testForWidth_kernel<<<gridDim, blockDim>>>(texDim, src_cudaTex, dst_cudaSurf, rank);
     CUDA_ENSURE(cudaDeviceSynchronize());
 
     // Copy the result from the CUDA device memory back to host memory.
     std::vector<Texel> dst_hostArr(src_hostArr.size());
     memcpy3DParms = {};
-    memcpy3DParms.srcPtr = dst_deviceArr;
+    memcpy3DParms.srcArray = dst_cudaArr;
     memcpy3DParms.dstPtr = make_cudaPitchedPtr(dst_hostArr.data(), texDim.x * sizeof(Texel), texDim.x, texDim.y);
-    memcpy3DParms.extent = byteExtent;
+    memcpy3DParms.extent = elemExtent;
     memcpy3DParms.kind = cudaMemcpyDefault;
     CUDA_ENSURE(cudaMemcpy3D(&memcpy3DParms));   
 
@@ -120,9 +135,10 @@ static bool test(dim3 texDim) {
     }
 
 
-    // Clean up
-    CUDA_ENSURE(cudaFree(dst_deviceArr.ptr));
-    CUDA_ENSURE(cudaDestroyTextureObject(src_cudaTex));    
+    // Clean up    
+    CUDA_ENSURE(cudaDestroySurfaceObject(dst_cudaSurf));
+    CUDA_ENSURE(cudaFreeArray(dst_cudaArr));
+    CUDA_ENSURE(cudaDestroyTextureObject(src_cudaTex));
     CUDA_ENSURE(cudaFreeArray(src_cudaArr));
 
     return allEqual;
@@ -131,7 +147,7 @@ static bool test(dim3 texDim) {
 std::vector<bool> testAxis(int axis) {
 
     const unsigned int otherSize = 1;
-    const unsigned int maxSize = 16384;
+    const unsigned int maxSize = 4300;// 16384;
 
     std::vector<bool> results;
     results.reserve(maxSize + 1);
