@@ -20,8 +20,8 @@ __global__ void testForWidth_kernel(int texWidth, cudaTextureObject_t src_tex, f
 	
     // Fetch the normalized texel value
 	const float fTex = tex1D<float>(src_tex, u);     
-    
-    // Write it out.
+
+	// Write it out.
 	dst_arr[x] = fTex;
 }
 
@@ -32,6 +32,7 @@ static void test(int width) {
 
     const cudaExtent elemExtent = make_cudaExtent(width, 1, 1);
 	const cudaExtent elemDim{ elemExtent.width, 0, 0 };
+	const cudaExtent byteDim{ elemExtent.width * sizeof(float), 1, 1 };
     
     // Create source data (on the host), fill it with runs of increasing values.
     std::vector<float> src_hostArr(static_cast<size_t>(width));
@@ -39,12 +40,12 @@ static void test(int width) {
 
     // Create a CUDA array and copy the data to it.
     const cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
-	cudaArray_t src_cudaArr{};
-    CUDA_ENSURE(cudaMalloc3DArray(&src_cudaArr, &channelDesc, elemDim, 0));
+	cudaArray_t src_cudaSwizzledArr{};
+    CUDA_ENSURE(cudaMalloc3DArray(&src_cudaSwizzledArr, &channelDesc, elemDim, 0));
 
     cudaMemcpy3DParms memcpy3DParms{};
     memcpy3DParms.srcPtr = make_cudaPitchedPtr(src_hostArr.data(), width * sizeof(float), width, 1);
-    memcpy3DParms.dstArray = src_cudaArr;
+    memcpy3DParms.dstArray = src_cudaSwizzledArr;
     memcpy3DParms.extent = elemExtent;
     memcpy3DParms.kind = cudaMemcpyDefault;
     CUDA_ENSURE(cudaMemcpy3D(&memcpy3DParms));
@@ -52,7 +53,7 @@ static void test(int width) {
     // Create a CUDA texture object to access the CUDA array.
     cudaResourceDesc resTexDesc{};
     resTexDesc.resType = cudaResourceTypeArray;
-    resTexDesc.res.array.array = src_cudaArr;
+    resTexDesc.res.array.array = src_cudaSwizzledArr;
     
     cudaTextureDesc texDesc{};
     texDesc.filterMode = cudaFilterModeLinear;    
@@ -64,7 +65,7 @@ static void test(int width) {
 
     // Create some CUDA memory to put the kernel result in.
 	float* dst_cudaArr = nullptr;
-	CUDA_ENSURE(cudaMalloc(&dst_cudaArr, width));
+	CUDA_ENSURE(cudaMalloc(&dst_cudaArr, width * sizeof(float)));
 	
     // Launch the kernel and wait for it to finish.
     const dim3 blockDim{ 32, 32, 1 };
@@ -78,7 +79,7 @@ static void test(int width) {
     memcpy3DParms = {};
 	memcpy3DParms.srcPtr = make_cudaPitchedPtr(dst_cudaArr, width * sizeof(float), width, 1);
     memcpy3DParms.dstPtr = make_cudaPitchedPtr(dst_hostArr.data(), width * sizeof(float), width, 1);
-    memcpy3DParms.extent = elemExtent;
+    memcpy3DParms.extent = byteDim;
     memcpy3DParms.kind = cudaMemcpyDefault;
     CUDA_ENSURE(cudaMemcpy3D(&memcpy3DParms));   
 
@@ -94,12 +95,12 @@ static void test(int width) {
     // Clean up    
     CUDA_ENSURE(cudaFree(dst_cudaArr));
     CUDA_ENSURE(cudaDestroyTextureObject(src_cudaTex));
-    CUDA_ENSURE(cudaFreeArray(src_cudaArr));
+    CUDA_ENSURE(cudaFreeArray(src_cudaSwizzledArr));
 }
 
 int main() {
 
-	const int width = 10;
+	const int width = 100;
 	test(width);
     return 0;    
 }
